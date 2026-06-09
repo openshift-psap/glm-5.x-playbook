@@ -1,0 +1,144 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm-pp
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          role: leader
+        annotations:
+          composite.dra/gpu-nic-pairs: "8"
+      spec:
+        containers:
+          - name: vllm-leader
+            image: vllm/vllm-openai:latest
+            env:
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: hf-token
+                    key: token
+              - name: NCCL_DEBUG
+                value: INFO
+              - name: HF_HOME
+                value: /modelcache
+            command:
+              - sh
+              - -c
+              - |
+                bash /vllm-workspace/examples/online_serving/multi-node-serving.sh leader \
+                  --ray_cluster_size=$(LWS_GROUP_SIZE) && \
+                exec vllm serve zai-org/GLM-5 \
+                  --port 8080 \
+                  --tensor-parallel-size 8 \
+                  --pipeline-parallel-size 2 \
+                  --distributed-executor-backend ray \
+                  --trust-remote-code
+            ports:
+              - containerPort: 8080
+            startupProbe:
+              httpGet:
+                path: /health
+                port: 8080
+              failureThreshold: 720
+              periodSeconds: 10
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: 8080
+              initialDelaySeconds: 15
+              periodSeconds: 10
+            resources:
+              requests:
+                cpu: 32
+                memory: 256Gi
+              limits:
+                memory: 512Gi
+            securityContext:
+              capabilities:
+                add:
+                  - IPC_LOCK
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: modelcache
+                mountPath: /modelcache
+                readOnly: true
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+          - name: modelcache
+            hostPath:
+              path: /var/mnt/modelcache
+              type: Directory
+    workerTemplate:
+      spec:
+        containers:
+          - name: vllm-worker
+            image: vllm/vllm-openai:latest
+            env:
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: hf-token
+                    key: token
+              - name: NCCL_DEBUG
+                value: INFO
+              - name: HF_HOME
+                value: /modelcache
+            command:
+              - sh
+              - -c
+              - |
+                bash /vllm-workspace/examples/online_serving/multi-node-serving.sh worker \
+                  --ray_address=$(LWS_LEADER_ADDRESS)
+            resources:
+              requests:
+                cpu: 32
+                memory: 256Gi
+              limits:
+                memory: 512Gi
+            securityContext:
+              capabilities:
+                add:
+                  - IPC_LOCK
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: modelcache
+                mountPath: /modelcache
+                readOnly: true
+        metadata:
+          annotations:
+            composite.dra/gpu-nic-pairs: "8"
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+          - name: modelcache
+            hostPath:
+              path: /var/mnt/modelcache
+              type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-pp-leader
+spec:
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    leaderworkerset.sigs.k8s.io/name: vllm-pp
+    role: leader
+  type: ClusterIP

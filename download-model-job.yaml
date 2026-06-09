@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: download-glm5
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: psap-gpu-xhnvx-worker-3-6bsjp
+      containers:
+        - name: download
+          image: vllm/vllm-openai:latest
+          command:
+            - bash
+            - -c
+            - |
+              echo "Downloading zai-org/GLM-5 ..."
+              hf download zai-org/GLM-5
+              echo "Download complete."
+              du -sh /modelcache/hub/models--zai-org--GLM-5/
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HOME
+              value: /modelcache
+            - name: HF_XET_HIGH_PERFORMANCE
+              value: "1"
+          resources:
+            requests:
+              cpu: 4
+              memory: 16Gi
+          volumeMounts:
+            - name: modelcache
+              mountPath: /modelcache
+      volumes:
+        - name: modelcache
+          hostPath:
+            path: /var/mnt/modelcache
+            type: Directory
+      restartPolicy: Never

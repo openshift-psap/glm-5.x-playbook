@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rsyncd-config
+data:
+  rsyncd.conf: |
+    [modelcache]
+    path = /modelcache
+    read only = true
+    use chroot = false
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-rsync-server
+  labels:
+    app: model-rsync-server
+spec:
+  serviceAccountName: model-sync
+  securityContext:
+    runAsUser: 0
+  nodeSelector:
+    kubernetes.io/hostname: psap-gpu-xhnvx-worker-3-6bsjp
+  containers:
+    - name: rsync
+      image: registry.access.redhat.com/ubi9/ubi:latest
+      command:
+        - sh
+        - -c
+        - |
+          dnf install -y rsync
+          echo "Serving /modelcache via rsync on port 873 ..."
+          rsync --daemon --no-detach --config=/etc/rsyncd/rsyncd.conf
+      ports:
+        - containerPort: 873
+      volumeMounts:
+        - name: modelcache
+          mountPath: /modelcache
+          readOnly: true
+        - name: rsyncd-config
+          mountPath: /etc/rsyncd
+      resources:
+        requests:
+          cpu: 2
+          memory: 4Gi
+  volumes:
+    - name: modelcache
+      hostPath:
+        path: /var/mnt/modelcache
+        type: Directory
+    - name: rsyncd-config
+      configMap:
+        name: rsyncd-config
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-rsync-server
+spec:
+  selector:
+    app: model-rsync-server
+  ports:
+    - port: 873
+      targetPort: 873
+  type: ClusterIP
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sync-glm5
+spec:
+  parallelism: 2
+  completions: 2
+  completionMode: Indexed
+  backoffLimit: 3
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - psap-gpu-xhnvx-worker-3-db7jp
+                      - psap-gpu-xhnvx-worker-3-dls46
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  batch.kubernetes.io/job-name: sync-glm5
+              topologyKey: kubernetes.io/hostname
+      serviceAccountName: model-sync
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: rsync
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command:
+            - sh
+            - -c
+            - |
+              dnf install -y rsync
+              echo "Syncing GLM-5 from model-rsync-server ..."
+              rsync -av --progress \
+                rsync://model-rsync-server/modelcache/hub/models--zai-org--GLM-5 \
+                /modelcache/hub/
+              echo "Sync complete."
+              du -sh /modelcache/hub/models--zai-org--GLM-5/
+          resources:
+            requests:
+              cpu: 4
+              memory: 8Gi
+          volumeMounts:
+            - name: modelcache
+              mountPath: /modelcache
+      volumes:
+        - name: modelcache
+          hostPath:
+            path: /var/mnt/modelcache
+            type: Directory
+      restartPolicy: Never

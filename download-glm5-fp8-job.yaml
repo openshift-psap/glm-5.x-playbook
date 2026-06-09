@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: download-glm5-fp8
+spec:
+  parallelism: 4
+  completions: 4
+  completionMode: Indexed
+  backoffLimit: 4
+  template:
+    spec:
+      serviceAccountName: model-sync
+      securityContext:
+        runAsUser: 0
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/8xh100
+                    operator: Exists
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  batch.kubernetes.io/job-name: download-glm5-fp8
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: download
+          image: vllm/vllm-openai:latest
+          command:
+            - bash
+            - -c
+            - |
+              echo "Node: $(hostname) — downloading zai-org/GLM-5-FP8 ..."
+              hf download zai-org/GLM-5-FP8
+              echo "Download complete."
+              du -sh /modelcache/hub/models--zai-org--GLM-5-FP8/
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HOME
+              value: /modelcache
+            - name: HF_XET_HIGH_PERFORMANCE
+              value: "1"
+          resources:
+            requests:
+              cpu: 4
+              memory: 16Gi
+          volumeMounts:
+            - name: modelcache
+              mountPath: /modelcache
+      volumes:
+        - name: modelcache
+          hostPath:
+            path: /var/mnt/modelcache
+            type: Directory
+      restartPolicy: Never

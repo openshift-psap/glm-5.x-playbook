@@ -1,65 +1,112 @@
-# GLM-5 Pipeline Parallel with vLLM + LWS
+# GLM-5.2-FP8 Benchmark Playbook
 
-Multi-node pipeline parallel serving of GLM-5 using LeaderWorkerSet and vLLM's multiprocessing backend.
+Reproducible benchmark playbook for GLM-5.2-FP8 on NVIDIA H200 with vLLM.
+Covers two topologies: pipeline parallel (PP=2, TP=8, 2 nodes) and single-node replicas (TP=8, MTP enabled).
 
 ## Prerequisites
 
-- LWS controller installed on cluster
-- Composite DRA webhook installed and enabled
-- `oc` CLI with cluster-admin access
-
-## Cluster Setup
-
-```bash
-# Create namespace
-oc new-project glm-5-pp
-
-# Label namespace for DRA webhook
-oc label ns glm-5-pp composite.dra/webhook-enabled=true
-
-# Create HF token secret
-oc create secret generic hf-token --from-literal=token=<YOUR_HF_TOKEN> -n glm-5-pp
-
-# Grant SCCs to default service account
-oc adm policy add-scc-to-user anyuid -z default -n glm-5-pp
-oc adm policy add-scc-to-user privileged -z default -n glm-5-pp
-```
-
-## Deploy
-
-### With dummy weights (no model download needed)
+- OpenShift/Kubernetes cluster with H200 GPU nodes
+- LeaderWorkerSet CRD installed (for PP topology)
+- `oc` or `kubectl` CLI configured
+- HuggingFace token stored as secret `hf-token` with key `token` in target namespace
+- Namespace created (default: `glm-5-pp`)
 
 ```bash
-oc apply -f lws-pp-multiproc.yaml -n glm-5-pp
+export KUBECONFIG=/path/to/kubeconfig.yaml
+export NS=glm-5-pp
+oc create namespace $NS --dry-run=client -o yaml | oc apply -f -
+oc create secret generic hf-token --from-literal=token=$HF_TOKEN -n $NS
 ```
 
-### With real weights on NVMe hostPath (poseidon)
+## Topology 1: Pipeline Parallel (PP=2, TP=8)
+
+Two nodes, one model split across both via pipeline parallelism.
+MTP speculative decoding is NOT available with PP ([vllm#44697](https://github.com/vllm-project/vllm/issues/44697)).
+
+### Deploy
 
 ```bash
-# Download to one node
-oc apply -f download-model-job.yaml -n glm-5-pp
-
-# Sync to remaining nodes
-oc apply -f sync-model-jobs.yaml -n glm-5-pp
-
-# Or download FP8 to all nodes in parallel
-oc apply -f download-glm5-fp8-job.yaml -n glm-5-pp
+oc apply -f manifests/pp2-tp8-lws.yaml -n $NS
 ```
 
-## Manifests
-
-| File | Description |
-|------|-------------|
-| `lws-pp-multiproc.yaml` | LWS with vLLM multiprocessing backend (PP=2, TP=8, no Ray) |
-| `lws-pp-ray.yaml` | LWS with Ray backend variant |
-| `download-model-job.yaml` | Download BF16 model to one node's NVMe |
-| `download-glm5-fp8-job.yaml` | Parallel FP8 download to all GPU nodes |
-| `sync-model-jobs.yaml` | Rsync server + client for cross-node model sync |
-
-## Clean Up
+### Wait for readiness (~10 min)
 
 ```bash
-oc delete lws vllm-pp -n glm-5-pp
-oc delete resourceclaimtemplates --all -n glm-5-pp
-oc delete resourceclaims --all -n glm-5-pp
+oc logs -f vllm-pp-0 -n $NS
+# Ready when: "Application startup complete."
 ```
+
+### Run benchmark
+
+```bash
+oc exec vllm-pp-0 -n $NS -- bash /benchmarks/sweep-concurrency.sh
+```
+
+### Cleanup
+
+```bash
+oc delete -f manifests/pp2-tp8-lws.yaml -n $NS
+```
+
+## Topology 2: Single-Node Replicas (TP=8, MTP enabled)
+
+Independent replicas, one per node. MTP speculative decoding enabled (5 tokens).
+Use for: throughput testing, prefix caching evaluation, scaling studies.
+
+### Deploy
+
+```bash
+oc apply -f manifests/tp8-replicas.yaml -n $NS
+```
+
+### Wait for readiness (~20 min, sequential StatefulSet)
+
+```bash
+oc get pods -n $NS -w
+# Ready when both vllm-0 and vllm-1 show 1/1 Running
+```
+
+### Run benchmarks
+
+```bash
+# WL1: Unique prompts (control — no cache benefit)
+oc exec vllm-0 -n $NS -- bash /benchmarks/wl1-unique.sh
+
+# WL2: Shared prefix (tests prefix cache reuse)
+oc exec vllm-0 -n $NS -- bash /benchmarks/wl2-shared-prefix.sh
+```
+
+### Cleanup
+
+```bash
+oc delete -f manifests/tp8-replicas.yaml -n $NS
+```
+
+## Customizing for Your Workload
+
+Edit the benchmark scripts to match your ISL/OSL:
+
+```bash
+# In any benchmark script, change these:
+ISL=100000    # → your input sequence length
+OSL=500       # → your output sequence length
+CONCURRENCY=8 # → your target concurrency
+NUM_PROMPTS=150
+```
+
+For real prompts instead of random, use `--dataset-name hf` with a HuggingFace dataset,
+or `--dataset-name custom` with `--dataset-path /path/to/prompts.jsonl`.
+
+## Cluster Info (Janus Reference)
+
+| Parameter | Value |
+|---|---|
+| Cluster | psap-de-h200-cluster (IBM rhperfscale) |
+| Nodes | 2× NVIDIA H200 (160 CPU, 1.8TB RAM, 8 GPUs each) |
+| OpenShift | 4.21.11, Kubernetes 1.34.6 |
+| GPU DRA | composite.dra/gpu-nic-pair (GPU + InfiniBand NIC bundle) |
+| vLLM | v0.23.0+ (vllm/vllm-openai:latest) |
+
+## Results Summary
+
+See `results/` for raw data and `results/SUMMARY.md` for analysis.

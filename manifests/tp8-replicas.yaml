@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vllm
+  labels:
+    app: vllm
+spec:
+  replicas: 2
+  serviceName: vllm-headless
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          command:
+            - sh
+            - -c
+            - |
+              vllm serve zai-org/GLM-5.2-FP8 \
+                --tensor-parallel-size 8 \
+                --kv-cache-dtype fp8 \
+                --speculative-config.method mtp \
+                --speculative-config.num_speculative_tokens 5 \
+                --tool-call-parser glm47 \
+                --reasoning-parser glm45 \
+                --enable-auto-tool-choice \
+                --served-model-name glm-5.2-fp8 \
+                --enable-prefix-caching \
+                --enable-chunked-prefill \
+                --max-model-len 131072 \
+                --load-format dummy \
+                --trust-remote-code \
+                --port 8000 \
+                --distributed-timeout-seconds 1200 || sleep infinity
+          ports:
+            - containerPort: 8000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 720
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 32
+              memory: 256Gi
+              composite.dra/gpu-nic-pair: "8"
+            limits:
+              memory: 512Gi
+              composite.dra/gpu-nic-pair: "8"
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-headless
+  labels:
+    app: vllm
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+  selector:
+    app: vllm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-roundrobin
+  labels:
+    app: vllm
+spec:
+  ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+  selector:
+    app: vllm
+  type: ClusterIP

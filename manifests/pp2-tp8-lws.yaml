@@ -1,0 +1,144 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm-pp
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          role: leader
+      spec:
+        containers:
+          - name: vllm-leader
+            image: vllm/vllm-openai:latest
+            env:
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: hf-token
+                    key: token
+            command:
+              - sh
+              - -c
+              - |
+                vllm serve zai-org/GLM-5.2-FP8 \
+                  --tensor-parallel-size 8 \
+                  --pipeline-parallel-size 2 \
+                  --nnodes 2 \
+                  --node-rank 0 \
+                  --master-addr 0.0.0.0 \
+                  --port 8080 \
+                  --load-format dummy \
+                  --kv-cache-dtype fp8 \
+                  --tool-call-parser glm47 \
+                  --reasoning-parser glm45 \
+                  --enable-auto-tool-choice \
+                  --served-model-name glm-5.2-fp8 \
+                  --skip-mm-profiling \
+                  --trust-remote-code \
+                  --distributed-timeout-seconds 1200 || sleep infinity
+            ports:
+              - containerPort: 8080
+            startupProbe:
+              httpGet:
+                path: /health
+                port: 8080
+              failureThreshold: 720
+              periodSeconds: 10
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: 8080
+              initialDelaySeconds: 15
+              periodSeconds: 10
+            resources:
+              requests:
+                cpu: 32
+                memory: 256Gi
+                composite.dra/gpu-nic-pair: "8"
+              limits:
+                memory: 512Gi
+                composite.dra/gpu-nic-pair: "8"
+            securityContext:
+              capabilities:
+                add:
+                  - IPC_LOCK
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+    workerTemplate:
+      spec:
+        containers:
+          - name: vllm-worker
+            image: vllm/vllm-openai:latest
+            env:
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: hf-token
+                    key: token
+            command:
+              - sh
+              - -c
+              - |
+                NODE_RANK=${HOSTNAME##*-}
+                vllm serve zai-org/GLM-5.2-FP8 \
+                  --tensor-parallel-size 8 \
+                  --pipeline-parallel-size 2 \
+                  --nnodes 2 \
+                  --node-rank $NODE_RANK \
+                  --master-addr $(LWS_LEADER_ADDRESS) \
+                  --headless \
+                  --load-format dummy \
+                  --kv-cache-dtype fp8 \
+                  --tool-call-parser glm47 \
+                  --reasoning-parser glm45 \
+                  --enable-auto-tool-choice \
+                  --served-model-name glm-5.2-fp8 \
+                  --skip-mm-profiling \
+                  --trust-remote-code \
+                  --distributed-timeout-seconds 1200 || sleep infinity
+            resources:
+              requests:
+                cpu: 32
+                memory: 256Gi
+                composite.dra/gpu-nic-pair: "8"
+              limits:
+                memory: 512Gi
+                composite.dra/gpu-nic-pair: "8"
+            securityContext:
+              capabilities:
+                add:
+                  - IPC_LOCK
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-pp-leader
+spec:
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    leaderworkerset.sigs.k8s.io/name: vllm-pp
+    role: leader
+  type: ClusterIP

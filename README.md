@@ -107,6 +107,20 @@ or `--dataset-name custom` with `--dataset-path /path/to/prompts.jsonl`.
 | GPU DRA | composite.dra/gpu-nic-pair (GPU + InfiniBand NIC bundle) |
 | vLLM | v0.23.0+ (vllm/vllm-openai:latest) |
 
+## Deployment Guides
+
+See [glm5.2-H200-guides/agentic-serving/](glm5.2-H200-guides/agentic-serving/) for validated deployment patterns:
+
+| Pattern | Context Length | Use Case |
+|---------|---------------|----------|
+| [Single-node practical](glm5.2-H200-guides/agentic-serving/glm-5.2-single-node-practical-guide.md) | 131K | Long-context agentic (Claude Code, coding agents) |
+| [Single-node 8K/1K optimized](glm5.2-H200-guides/agentic-serving/glm-5.2-single-node-8k1k-optimized.md) | 10K | Short-context, high-turnover |
+| [Multi-node PP2/TP8](glm5.2-H200-guides/agentic-serving/glm-5.2-multi-node-pp2-tp8.md) | 100K+ | Model/KV beyond single node HBM |
+
+### Auxiliary
+
+- [Connecting Claude Code to vLLM](glm5.2-H200-guides/auxiliary/claude-code-vllm-connection-guide.md) — route Claude Code through your vLLM deployment via `/v1/messages`
+
 ## Results Summary
 
 See `results/` for raw data and `results/SUMMARY.md` for analysis.

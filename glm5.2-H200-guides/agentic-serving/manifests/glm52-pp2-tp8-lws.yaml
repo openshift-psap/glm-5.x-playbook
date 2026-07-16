@@ -1,0 +1,177 @@
+# GLM-5.2-FP8 across 2× 8×H200 nodes: PP=2, TP=8 via LeaderWorkerSet.
+#
+# Requirements:
+# - LeaderWorkerSet controller installed (kubernetes-sigs/lws)
+# - vLLM >= v0.23.0 (minimum version for GLM-5.2 model support).
+# - Secret llm-d-hf-token with key HF_TOKEN in the target namespace
+# - For RoCE/InfiniBand: uncomment the RDMA blocks below and set the
+#   interface/HCA names for your fabric (values are provider-specific).
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm-pp
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          role: leader
+      spec:
+        containers:
+          - name: vllm-leader
+            image: vllm/vllm-openai:v0.23.0
+            env:
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: llm-d-hf-token
+                    key: HF_TOKEN
+              # --- RoCE / InfiniBand (uncomment and set for your fabric;
+              #     keep leader and worker SYMMETRIC) ---
+              # - name: NCCL_SOCKET_IFNAME
+              #   value: "eth0"          # host TCP interface for NCCL bootstrap
+              # - name: GLOO_SOCKET_IFNAME
+              #   value: "eth0"          # torch.distributed gloo bootstrap
+              # - name: NCCL_IB_HCA
+              #   value: "mlx5"          # HCA prefix or explicit list (e.g. ibp0,ibp1)
+              # - name: NCCL_IB_GID_INDEX
+              #   value: "3"             # RoCEv2 GID index (fabric-specific)
+            command: ["sh", "-c"]
+            args:
+              - |
+                vllm serve zai-org/GLM-5.2-FP8 \
+                  --tensor-parallel-size 8 \
+                  --pipeline-parallel-size 2 \
+                  --nnodes 2 \
+                  --node-rank 0 \
+                  --master-addr 0.0.0.0 \
+                  --port 8080 \
+                  --kv-cache-dtype fp8 \
+                  --tool-call-parser glm47 \
+                  --reasoning-parser glm45 \
+                  --enable-auto-tool-choice \
+                  --served-model-name glm-5.2-fp8 \
+                  --enable-prefix-caching \
+                  --enable-chunked-prefill \
+                  --skip-mm-profiling \
+                  --trust-remote-code \
+                  --distributed-timeout-seconds 1200
+            ports:
+              - containerPort: 8080
+            startupProbe:
+              httpGet:
+                path: /health
+                port: 8080
+              failureThreshold: 720
+              periodSeconds: 10
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: 8080
+              initialDelaySeconds: 15
+              periodSeconds: 10
+            resources:
+              requests:
+                cpu: 32
+                memory: 256Gi
+                nvidia.com/gpu: "8"
+                # rdma/ib: "1"          # uncomment on RDMA-enabled clusters
+              limits:
+                memory: 512Gi
+                nvidia.com/gpu: "8"
+                # rdma/ib: "1"
+            securityContext:
+              capabilities:
+                add:
+                  - IPC_LOCK
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+    workerTemplate:
+      spec:
+        containers:
+          - name: vllm-worker
+            image: vllm/vllm-openai:v0.23.0
+            env:
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: llm-d-hf-token
+                    key: HF_TOKEN
+              # --- RoCE / InfiniBand (keep SYMMETRIC with leader) ---
+              # - name: NCCL_SOCKET_IFNAME
+              #   value: "eth0"
+              # - name: GLOO_SOCKET_IFNAME
+              #   value: "eth0"
+              # - name: NCCL_IB_HCA
+              #   value: "mlx5"
+              # - name: NCCL_IB_GID_INDEX
+              #   value: "3"
+            command: ["sh", "-c"]
+            # LWS injects LWS_WORKER_INDEX (1..size-1) and
+            # LWS_LEADER_ADDRESS into every container; Kubernetes
+            # expands the $(VAR) references below before the shell runs.
+            args:
+              - |
+                vllm serve zai-org/GLM-5.2-FP8 \
+                  --tensor-parallel-size 8 \
+                  --pipeline-parallel-size 2 \
+                  --nnodes 2 \
+                  --node-rank $(LWS_WORKER_INDEX) \
+                  --master-addr $(LWS_LEADER_ADDRESS) \
+                  --headless \
+                  --kv-cache-dtype fp8 \
+                  --tool-call-parser glm47 \
+                  --reasoning-parser glm45 \
+                  --enable-auto-tool-choice \
+                  --served-model-name glm-5.2-fp8 \
+                  --enable-prefix-caching \
+                  --enable-chunked-prefill \
+                  --skip-mm-profiling \
+                  --trust-remote-code \
+                  --distributed-timeout-seconds 1200
+            resources:
+              requests:
+                cpu: 32
+                memory: 256Gi
+                nvidia.com/gpu: "8"
+                # rdma/ib: "1"
+              limits:
+                memory: 512Gi
+                nvidia.com/gpu: "8"
+                # rdma/ib: "1"
+            securityContext:
+              capabilities:
+                add:
+                  - IPC_LOCK
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-pp-leader
+spec:
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    leaderworkerset.sigs.k8s.io/name: vllm-pp
+    role: leader
+  type: ClusterIP

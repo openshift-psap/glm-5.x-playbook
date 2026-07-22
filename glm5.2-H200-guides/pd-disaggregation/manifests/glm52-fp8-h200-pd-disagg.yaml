@@ -1,0 +1,309 @@
+# GLM-5.2 FP8 H200 P/D Disaggregated Serving via llm-d
+#
+# Topology: 2x H200 nodes (8 GPUs each, 16 total)
+#   - 1 prefill pod:  TP1 x CP8 (context-parallel prefill across 8 GPUs)
+#   - 1 decode pod:   TP8 (tensor-parallel decode across 8 GPUs)
+#   - KV transfer:    NIXL + OffloadingConnector (CPU offload for 1M context)
+#
+# Derived from the InferenceX PR #2275 SGLang HiSparse recipe, translated to
+# vLLM with the Nemotron-3 Ultra MultiConnector pattern from
+# llm-d/guides/agentic-serving/modelserver/gpu/vllm/nemotron-3-ultra/.
+#
+# CPU offload replaces HiSparse as the host-DRAM KV strategy. The
+# OffloadingConnector lazy-offloads KV blocks to pinned CPU memory so the
+# full 1M context fits without OOM on decode. Tune cpu_bytes_to_use based on
+# available system DRAM (default: 200 GB per pod ≈ ~25 GB/GPU).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glm52-prefill
+  labels:
+    app: glm52-prefill
+    llm-d.ai/role: prefill
+    llm-d.ai/model: GLM-5.2-FP8
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: glm52-prefill
+  template:
+    metadata:
+      labels:
+        app: glm52-prefill
+        llm-d.ai/role: prefill
+        llm-d.ai/model: GLM-5.2-FP8
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.23.0
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - "zai-org/GLM-5.2-FP8"
+            - "--trust-remote-code"
+            - "--served-model-name=glm-5.2-fp8"
+            - "--tensor-parallel-size=1"
+            - "--context-parallel-size=8"
+            - "--kv-cache-dtype=bfloat16"
+            - "--max-model-len=1048576"
+            - "--max-num-seqs=32"
+            - "--max-num-batched-tokens=32768"
+            - "--enable-chunked-prefill"
+            - "--gpu-memory-utilization=0.85"
+            - "--no-enable-prefix-caching"
+            - "--block-size=64"
+            - "--tool-call-parser=glm47"
+            - "--reasoning-parser=glm45"
+            - "--enable-auto-tool-choice"
+            - "--disable-uvicorn-access-log"
+            - "--kv-transfer-config"
+            - '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_connector_extra_config":{"bidirectional_kv_xfer":true}},{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":214748364800,"lazy_offload":true}}]}}'
+            - "--port=8000"
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: VLLM_USE_V1
+              value: "1"
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+              value: "5600"
+            - name: VLLM_WORKER_MULTIPROC_METHOD
+              value: "spawn"
+            - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+              value: "120"
+            - name: VLLM_SKIP_P2P_CHECK
+              value: "1"
+            - name: TORCH_DISTRIBUTED_DEFAULT_TIMEOUT
+              value: "1800"
+            - name: UCX_TLS
+              value: "cuda_copy,cuda_ipc,rc,tcp"
+            - name: UCX_MEMTYPE_CACHE
+              value: "n"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_P2P_LEVEL
+              value: "NVL"
+          resources:
+            limits:
+              cpu: "48"
+              memory: 600Gi
+              nvidia.com/gpu: "8"
+            requests:
+              cpu: "32"
+              memory: 300Gi
+              nvidia.com/gpu: "8"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 120
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /.cache
+              name: torch-compile-cache
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: torch-compile-cache
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glm52-decode
+  labels:
+    app: glm52-decode
+    llm-d.ai/role: decode
+    llm-d.ai/model: GLM-5.2-FP8
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: glm52-decode
+  template:
+    metadata:
+      labels:
+        app: glm52-decode
+        llm-d.ai/role: decode
+        llm-d.ai/model: GLM-5.2-FP8
+    spec:
+      initContainers:
+        - name: routing-proxy
+          image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:main
+          args:
+            - --port=8000
+            - --vllm-port=8200
+            - --kv-connector=nixlv2
+            - --zap-log-level=4
+            - --secure-proxy=false
+          env:
+            - name: OTEL_SDK_DISABLED
+              value: "true"
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.23.0
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - "zai-org/GLM-5.2-FP8"
+            - "--trust-remote-code"
+            - "--served-model-name=glm-5.2-fp8"
+            - "--tensor-parallel-size=8"
+            - "--kv-cache-dtype=bfloat16"
+            - "--max-model-len=1048576"
+            - "--max-num-seqs=200"
+            - "--gpu-memory-utilization=0.85"
+            - "--no-enable-prefix-caching"
+            - "--block-size=64"
+            - "--cpu-offload-gb=100"
+            - "--tool-call-parser=glm47"
+            - "--reasoning-parser=glm45"
+            - "--enable-auto-tool-choice"
+            - "--disable-uvicorn-access-log"
+            - "--kv-transfer-config"
+            - '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"bidirectional_kv_xfer":true}},{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":214748364800,"lazy_offload":true}}]}}'
+            - "--port=8200"
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: VLLM_USE_V1
+              value: "1"
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+              value: "5600"
+            - name: VLLM_WORKER_MULTIPROC_METHOD
+              value: "spawn"
+            - name: VLLM_SKIP_P2P_CHECK
+              value: "1"
+            - name: TORCH_DISTRIBUTED_DEFAULT_TIMEOUT
+              value: "1800"
+            - name: UCX_TLS
+              value: "cuda_copy,cuda_ipc,rc,tcp"
+            - name: UCX_MEMTYPE_CACHE
+              value: "n"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_P2P_LEVEL
+              value: "NVL"
+          resources:
+            limits:
+              cpu: "48"
+              memory: 600Gi
+              nvidia.com/gpu: "8"
+            requests:
+              cpu: "32"
+              memory: 300Gi
+              nvidia.com/gpu: "8"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8200
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 120
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8200
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8200
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /.cache
+              name: torch-compile-cache
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: torch-compile-cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: glm52-prefill
+  labels:
+    app: glm52-prefill
+    llm-d.ai/role: prefill
+spec:
+  type: ClusterIP
+  selector:
+    app: glm52-prefill
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: glm52-decode
+  labels:
+    app: glm52-decode
+    llm-d.ai/role: decode
+spec:
+  type: ClusterIP
+  selector:
+    app: glm52-decode
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
